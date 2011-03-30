@@ -1,0 +1,564 @@
+#!/bin/bash
+# vim: set ft=sh tabstop=4 shiftwidth=4:
+
+# Defaults (configurable)
+CONFIG=""
+CONFIG_FILE="/etc/$(basename ${0}).conf"
+SIZE="1G"
+VG="vg"
+SNAPSHOT_VG="vg"
+VOLUME="shares"
+BASEDIR="/srv/samba/shares/.snapshots"
+EXTENT="1G"
+LATEST_NAME="latest"
+MAX_SIZE="0"
+MAX_SPACE="0"
+MOUNT_OPTS="ro"
+VERBOSE=""
+declare -i RETENTION=0
+declare -i THRESHOLD=66
+
+usage() {
+	cat <<EOF
+Samba Shadow Copy Manager
+circa October 2009, Jared Hancock
+
+Creates and mounts snapshots, manages snapshot sizes dynamically and can
+auto-mount all snapshots at boot time.
+
+Multiple commands may be used at the same time. They are individually
+executed in the order listed on the commandline.
+
+Usage:
+Options and commands can be intermixed in any order
+
+    $(basename $0) [options] command [command [...]]
+
+Commands:
+    clean           Clean old and inactive snapshots
+    grow            Grow snapshots by the extent size so that the usage
+                    of each is less than the threshold amount
+    latest          Maintain a link to the latest snapshot, named "$LATEST_NAME"
+    mount-all       Mount all (unmounted) snapshots (useful at boot)
+    snapshoot       Create and mount a snapshot now
+    status          Display status of snapshots
+
+Options:
+    -b, --base      Base directory to mount snapshots for this volume into.
+                    Default is '$BASEDIR'
+    -c, --config    Use section from configuration file. Empty means read
+                    items not inside a group (global)
+                    Default is '$CONFIG'
+    --config-file   Use alternate configuration file. 
+                    Default is '$CONFIG_FILE'
+    -e, --extent    Extent size for snapshots. This size is appended to 
+                    snapshots as their usage exceeds the threshold 
+                    amount (-t). This value can be the percentage of the
+                    snapshot current size with trailing '%' character.
+                    Default is '$EXTENT'
+    -h, --help      Display this help message
+    -lv, --volume   Volume to manage snapshots for and/or take snapshot
+                    of. Default is '$VOLUME'
+    --latest        Set the name of the 'latest' link. Default is '$LATEST_NAME'
+    -M, --max-size  Maximum size of snapshots. Snapshots will not grow over
+                    this size. Zero means no maximum. Default is '$MAX_SIZE'.
+    -o, --mount-opts
+                    Mount options when mounting snapshots. Defaults are
+                    '$MOUNT_OPTS'
+    -r, --retention Number of snapshots to retain for this volume. This 
+                    number should be the number of snapshots taken per day
+                    times the number of days to retain snapshots. For 
+                    instance, to retain 15 days of snapshots taken twice 
+                    each day, retention should be 30. Default is '$RETENTION'.
+                    See also -S for setting retention based on capacity.
+                    Zero means no limit of snapshots.
+    -s, --size      Specify the intial size of snapshots. This size should
+                    be set at least to the amount of changes expected
+                    between shapshot periods. If you expect 1G of changes
+                    every day and take two snapshots each day, size could
+                    be set at 512M. Default is '$SIZE'
+    -t, --threshold Specify the percentage of used space in a snapshot to
+                    tolerate before increasing its size by 1 extent (-e). 
+                    Default is '$THRESHOLD'
+    -T, --temp      Work with temporary snapshots. If snapshoot-ing, a temp
+                    snapshot will be created. If clean-ing, temporary
+                    snapsots will be cleaned up
+    -S, --max-space Absolute maximum amount of space allocated to snapshots
+                    for the volume in question. When the size of all the
+                    snapshots reaches this amount, snapshots will not be
+                    grown any further. Zero means no maximum. 
+                    Default is '$MAX_SPACE'.
+    -v, --verbose   Do things verbosely
+    -vg, --group    Volume group containing the logical volume to snapshoot.
+                    Default is '$VG'
+EOF
+}
+
+parseargs() {
+	echo "Parseargs: $@"
+	while [[ -n $1 ]]; do
+		case $1 in
+			# Switches and configuration
+			-b|--base)		shift; BASEDIR=$1;;
+			-c|--config)	shift; CONFIG=$1;;
+			--config-file)	shift; CONFIG_FILE=$1;;
+			-e|--extent)	shift; EXTENT=$1;;
+			-h|--help)		COMMAND="help";;
+			-lv|--volume)	shift; VOLUME=$1;;
+			--latest)		shift; LATEST_NAME=$1;;
+			-M|--max-size)	shift; MAX_SIZE=$(convert_size $1);;
+			-o|--mount-opts)
+							shift; MOUNT_OPTS=$1;;
+			-r|--retention)	shift; RETENTION=$1;;
+			-s|--size)		shift; SIZE=$1;;
+			-S|--max-space)	shift; MAX_SPACE=$(convert_size $1);;
+			-t|--threshold)	shift; THRESHOLD=$1;;
+			-T|--temp)		TEMPORARY=1;;
+			-v|--verbose)	VERBOSE="1";;
+			-vg|--group)	shift; VG=$1;;
+			-*)				echo "!!! Ignoring invalid argument $1";;
+			# Arguments (commands)
+			snapshoot|latest|mount-all|clean|grow|status)
+							COMMAND="$COMMAND $1";;
+			*)				echo "!!! Invalid command $!"; exit -1;;
+		esac
+		shift
+	done
+}
+
+sanitize() {
+	# TODO: Check data types of configured items to ensure
+	#		command-line input is valid
+	#
+	# Non-configurable items
+	SNAPTAB="$BASEDIR/snapshottab"
+	# Create shapshot file (?)
+	if [[ ! -e $SNAPTAB ]]; then
+		if [[ ! -d $BASEDIR ]]; then
+			echo "!!! Snapshot base folder, $BASEDIR does not exist"
+			exit 1
+		fi
+		touch $SNAPTAB
+	fi
+}
+# Function: create_snapshot
+# Creates a new snapshot. 
+#
+# Environment:
+# SNAPNAME - Snapshot name
+# VOLUME - Volume to snapshoot
+# SIZE - Snapshot size
+create_snapshot() {
+	# XXX: Use VOLUME prefix or something to allow for this script
+	#      system governing snapshots of multiple volumes
+	SNAPNAME=$(TZ=GMT date +%Y.%m.%d-%H.%M.%S)
+	if [[ -z $VOLUME ]]; then
+		echo "!!! Volume required. Use -v option"
+		exit 1
+	fi
+	# Create snapshot
+	echo "Creating snapshot of '$VOLUME'"
+	# XXX: See if the volume is XFS
+	fsinfo=($(cat /proc/mounts | grep /dev/mapper/$VG-${VOLUME/-/--}))
+	if [[ ${fsinfo[2]} == "xfs" ]]; then
+		echo "Freezing XFS filesystem ${fsinfo[1]}"
+		xfs_freeze -f ${fsinfo[1]}
+	fi
+	lvcreate -L $SIZE -s -n $SNAPNAME /dev/$VG/$VOLUME
+	[[ ${fsinfo[2]} == "xfs" ]] && xfs_freeze -u ${fsinfo[1]}
+	# Record the snapshot
+	record_snapshot $SNAPNAME $VOLUME ${TEMPORARY:+temp}
+	# Mount the snapshot
+	mount_snapshot $SNAPNAME
+}
+
+# Function: mount_snapshot
+# Mounts the named SNAPNAME snapshot to a folder inside the
+# BASEDIR location
+#
+# Arguments:
+# 1 - Snapshot name (time of snapshot)
+#
+# Environment:
+# BASEDIR - Base of mountpoints
+mount_snapshot() {
+	local SNAPNAME=$1
+	# Create mountpoint
+	if [[ ! -d $BASEDIR/@GMT-$SNAPNAME ]]; then
+		[[ $VERBOSE ]] && echo "Creating snapshot mountpoint"
+		mkdir $BASEDIR/@GMT-$SNAPNAME
+	fi
+	# See if already mounted
+	if [[ -z $(mount | grep "/dev/mapper/$VG-${SNAPNAME/-/--}") ]]; then
+		# Mount snapshot
+		[[ $VERBOSE ]] && echo "Mounting snapshot '$SNAPNAME'"
+		local IFS=" "
+		fsinfo=($(cat /proc/mounts | grep /dev/mapper/$VG-$VOLUME))
+		if [[ ${fsinfo[2]} == "xfs" ]]; then
+			if [[ ! ${MOUNT_OPTS} =~ ",nouuid" ]]; then
+				MOUNT_OPTS="$MOUNT_OPTS,nouuid,norecovery"
+			fi
+		fi
+		mount /dev/$VG/$SNAPNAME $BASEDIR/@GMT-$SNAPNAME -o "$MOUNT_OPTS"
+	fi
+}
+
+# Function: unmount_snapshot
+# Unounts the named SNAPNAME
+#
+# Arguments:
+# 1 - Snapshot name (time of snapshot)
+#
+# Environment:
+# BASEDIR - Base of mountpoints
+unmount_snapshot() {
+	local SNAPNAME=$1
+	# See if  mounted
+	if [[ -n $(mount | grep "/dev/mapper/$VG-${SNAPNAME/-/--}") ]]; then
+		# Unmount snapshot
+		[[ $VERBOSE ]] && echo "Unmounting snapshot '$SNAPNAME'"
+		umount /dev/$VG/$SNAPNAME
+	fi
+}
+# Function: mount_all_snapshots
+# Mounts all snapshots of the named volume, or all recorded snapshots
+# if no volume is specified
+#
+# Environment:
+# VOLUME - volume for which to mount snapshots
+mount_all_snapshots() {
+	[[ $VERBOSE ]] && echo "Mounting all snapshots for volume $VOLUME"
+	grep ";$VOLUME;" $SNAPTAB | while read line; do
+		local IFS=";"
+		entry=($line)
+		mount_snapshot ${entry[0]}
+	done
+}
+
+# Function: do_latest
+# Creates a link named '$LATEST_NAME' to point to the most recent
+# snapshot created. The snapshot will be created if it does not
+# exist and moved if it exists and does not point to the latest
+# snapshot created.
+#
+# Environment:
+# BASEDIR - base directory of snapshots
+# LATEST_NAME
+do_latest() {
+	pushd . > /dev/null
+	cd "$BASEDIR"
+	ln -snf "$(ls -r | grep "@GMT" | head -1)" "$LATEST_NAME"
+	popd > /dev/null
+}
+
+# Function: record_snapshot
+# Records a (new) snapshot into the SNAPTAB file
+#
+# Arguments:
+# 1 - Snapshot name (timestamp)
+# 2 - Volume snapshot is of
+# 3 - Options (temp)
+#
+# Environment:
+# SNAPTAB - location of shapshot table file
+record_snapshot() {
+	# Lines in the shapshot file are
+	# timestamp;volume;opts
+	echo "$1;$2;$3" >> $SNAPTAB
+}
+
+# Function: remove_snapshot
+# Removes a named snapshot from the SNAPTAB file
+#
+# Arguments:
+# 1 - Name (timestamp) of snapshot to remove
+# 2 - Volume of snapshot to remove
+#
+# Environment:
+# SNAPTAB - snapshot table file
+# SNAPSHOT_VG - snapshot volume group
+remove_snapshot() {
+	# Read shapshot data, removing named TS and VOLUME and write it back
+	# the the SNAPTAB file
+	local IFS=$'\n'
+	{ 
+		{ 
+			for entry in $(cat - | grep -E ";$2;" | sort -t \; -k 1,1 -r); do
+				if [[ -n $(echo $entry | grep -E "^$1") ]]; then
+					# Unmount (?)
+					unmount_snapshot ${1}
+					# This is slated to be removed
+					[[ $VERBOSE ]] && echo "Removing snapshot '$1' of volume '$2'"
+					# XXX: Bug in LVM2 that sometimes prevents unmounted logical
+					#      volumes from being removed. Fix applied from
+					#      http://tuxrx.org/content/cant-remove-open-logical-volume-error
+					/sbin/dmsetup remove ${SNAPSHOT_VG}-${1/-/--}
+					/sbin/lvremove /dev/${SNAPSHOT_VG}/${1} -f 2>&1
+					# Remove mountpoint
+					rmdir $BASEDIR/@GMT-$1 2>&1
+				else
+					# Keep this one
+					echo "$entry" >&2
+				fi
+			done
+		} < $SNAPTAB 
+	} 2> $SNAPTAB.bak
+	mv $SNAPTAB.bak $SNAPTAB
+}
+
+# Function: clean_snapshots
+# Removes snapshots falling outside the retention period or marked
+# inactive by LVM
+#
+# Environment:
+# RETENTION - Number of snapshots to keep
+# VOLUME - Volume to manage snapshots for
+# SNAPTAB - Snapshot table
+clean_snapshots() {
+	[[ -n $VERBOSE ]] && echo "Cleaning old and invalid snapshots"
+	local -i count=1
+	for entry in $(grep -E ";$VOLUME;" $SNAPTAB | sort -t \; -k 1,1); do
+		local IFS=";"
+		entry=($entry)
+		if [[ $(get_snapshot_status ${entry[0]}) == "INVALID" ]]; then
+			[[ -n $VERBOSE ]] && echo "Cleaning inactive snapshot ${entry[0]}"
+			remove_snapshot ${entry[0]} $VOLUME
+			continue
+		elif [[ -z $(get_snapshot_status ${entry[0]}) ]]; then
+			[[ -n $VERBOSE ]] && echo "Cleaning missing snapshot ${entry[0]}"
+			remove_snapshot ${entry[0]} $VOLUME
+			continue
+		elif [[ ${entry[2]} =~ "temp" ]]; then
+			# Temporary snapshots don't count toward retention
+			if [[ -n $TEMPORARY ]]; then
+				# Remove this temporary snapshot
+				[[ -n $VERBOSE ]] && echo "Cleaning temporary snapshot ${entry[0]}"
+				remove_snapshot ${entry[0]} $VOLUME
+			fi
+			continue
+		elif [[ "1" == $(echo "( $RETENTION != 0 )  && ( $count > $RETENTION )" | bc) ]]; then
+			# Drop this snapshot
+			[[ -n $VERBOSE ]] && echo "Cleaning old snapshot ${entry[0]}"
+			remove_snapshot ${entry[0]} $VOLUME
+			continue
+		elif [[ "1" == $(echo "( $MAX_SPACE != 0 ) && ( $MAX_SPACE < $(get_total_size) )" | bc) ]]; then
+			# Snapshots are enumerated here is reverse order by date. 
+			# Remove the oldest one
+			[[ -n $VERBOSE ]] && echo "Cleaning snapshot ${entry[0]} to free space"
+			remove_snapshot ${entry[0]} $VOLUME
+			# Invalidate statistics
+			STATS=""
+			continue
+		fi
+		# Only count snapshots not being deleted
+		count=$(($count + 1))
+	done
+}
+
+# Function: grow_snapshots
+# Grows all snapshots listed in the SNAPTAB file whose usage is over the
+# THRESHOLD amount by 1 or more EXTENT's until each usage is below the
+# THRESHOLD amount
+#
+# Environment:
+# TRESHOLD - Minimum usage of snapshot tolerated
+# SNAPTAB - Snapshot table file
+# SNAPSHOT_VG - Volume group for snapshots
+grow_snapshots() {
+	# Read snapshot table entries
+	[[ -n $VERBOSE ]] && echo "Checking sizes of snapshots for volume $VOLUME"
+	grep -E ";$VOLUME" $SNAPTAB | while read line; do
+		local IFS=";"
+		# entry index: [0] - timestamp, [1] - volume
+		entry=($line)
+		# If at or above MAX_SPACE, don't grow anything
+		if [[ "1" == $(echo "( $MAX_SPACE != 0 ) && ( $MAX_SPACE < $(get_total_size) )" | bc) ]]; then
+			echo "!!! Max snapshot space of $MAX_SPACE has been reached."
+			break
+		# If usage is over TRESHOLD, add an EXTENT
+		elif [[ "1" == $(echo "$(get_snapshot_usage ${entry[0]}) > $THRESHOLD" | bc) ]]; then
+			[[ -n $VERBOSE ]] && echo "Snapshot ${entry[0]} usage $(get_snapshot_usage ${entry[0]})% over threshold ${THRESHOLD}%"
+			# See if snapshot size is at or over the limit
+			size=$(convert_size $(get_snapshot_size ${entry[0]}))
+			if [[ "1" == $(echo "( $MAX_SIZE != 0 ) && ( $MAX_SIZE < $size )" | bc) ]]; then
+				echo "!!! Snapshot ${entry[0]} is at maximum size"
+			else
+				# Add an extent
+				[[ -n $VERBOSE ]] && echo "Extending snapshot ${entry[0]} of ${entry[1]}"
+				OPTION="-L+$EXTENT"
+				[[ ${EXTENT: -1:1} == "%" ]] && OPTION="-l+${EXTENT}LV"
+				/sbin/lvextend $OPTION /dev/$SNAPSHOT_VG/${entry[0]}
+			fi
+		fi
+	done
+}
+
+# Function: convert_sizes
+# Converts sizes with optional units. No units implies the sizes are
+# expressed in bytes. k is used for kilo-bytes and so forth.
+#
+convert_size() {
+	local -i B=1
+	local -i K=1024
+	local -i M=1048576
+	local -i G=1073741824
+	local -i T=1099511627776
+
+	while [[ -n $1 ]]; do
+		i=$1
+		for e in B K M G T; do
+			if [[ ${i: -1:1} =~ "[^BKMGT]" 
+					|| $(echo ${i: -1:1} | tr bkmgt BKMGT) == $e ]]; then
+				# Multiply arg by multiplier of unit
+				echo "${i:0:$((${#i}-1))} * ${!e}" | bc
+				break
+			fi
+		done
+		shift
+	done
+}
+
+collect_stats() {
+	if [[ -n $STATS ]]; then
+		echo "$STATS"
+		return
+	fi
+	lvs /dev/$VG --noheadings --separator=: 2> /dev/null | sed -re "s/^ *//g"
+}
+STATS=$(collect_stats)
+
+# Function: get_snapshot_usage
+# Outputs current usage of requested snapshot
+#
+# Arguments:
+# 1 - Snapshot name (timestamp)
+get_snapshot_usage() {
+	collect_stats | while read line; do
+		local IFS=":"
+		entry=($line)
+		if [[ ${entry[0]} == $1 ]]; then
+			echo ${entry[5]}
+			break
+		fi
+	done
+}
+
+# Function: get_snapshot_status
+# Outputs current status of requested snapshot
+#
+# Arguments:
+# 1 - Snapshot name (timestamp)
+get_snapshot_size() {
+	collect_stats | while read line; do
+		local IFS=":"
+		entry=($line)
+		if [[ ${entry[0]} == $1 ]]; then
+			echo ${entry[3]}
+			break
+		fi
+	done
+}
+
+# Function: get_snapshot_status
+# Outputs size of requested snapshot
+#
+# Arguments:
+# 1 - Snapshot name (timestamp)
+get_snapshot_status() {
+	collect_stats | while read line; do
+		local IFS=":"
+		entry=($line)
+		if [[ ${entry[0]} == $1 ]]; then
+			local lvstatus=(${entry[2]})
+			case ${lvstatus:0:1} in
+				'S')	echo "INVALID";;
+				's')	echo "active";;
+				*)		echo "<unknown>";;
+			esac
+			break
+		fi
+	done
+}
+
+get_total_size() {
+	local -i total=0
+	local IFS=$'\n'
+	for x in $(grep ";$VOLUME" $SNAPTAB); do
+		local IFS=";"
+		entry=($x)
+		v=$(convert_size $(get_snapshot_size ${entry[0]}))
+		let total+=${v%.*}
+	done
+	echo $total
+}
+
+show_snapshot_stats() {
+		cat <<EOF
+Snapshots for volume "$VOLUME" --------
+Timestamp        	Status	Size	Usage (%)
+--------------------------------------------------
+EOF
+	grep ";$VOLUME" $SNAPTAB | sort -t \; -k 1,1 -r | while read line; do
+		local IFS=";"
+		entry=($line)
+		S=${entry[0]}
+		echo -e "$S\t$(get_snapshot_status $S)\t$(get_snapshot_size $S)\t$(get_snapshot_usage $S)"
+	done
+	[[ $MAX_SPACE != 0 ]] && echo "Total size of all snapshots is $(get_total_size) bytes"
+	echo
+}
+
+# Function: read_config
+# Reads configuration from $CONFIG_FILE
+# 
+# Environment:
+# CONFIG_FILE - Location of configuration file
+# CONFIG - Config section to read (empty means global)
+read_config() {
+	# Read globals
+	local script=":s;/^ *\[/b n;H;n;b s;:n;x;p;q"
+	# Read from specific section
+	# XXX: Doesn't match if section is the last in a file with no trailing
+	#      empty line
+	[[ -n $CONFIG ]] && script="/^\[${CONFIG}\]/{;:s;n;/^ *\[|$/b n;H;b s;:n;x;p;q;}"
+	while [[ -n $1 ]]; do shift; done
+	IFS=$'\n' parseargs $(
+		sed -ne "${script}" "$CONFIG_FILE" \
+		| while read line; do          
+			IFS="="$'\n' parts=(${line})
+            echo "Config file line -- " $line
+			parts[0]=${parts[0]//[[:space:]]/}
+			[[ -z ${parts[0]} || ${parts[0]:0:1} == "#" ]] && continue
+			echo "--${parts[0]}"; echo "${parts[1]//\"/}"
+		done)
+}
+
+# Process commandline (to grab the config-file and config-section)
+parseargs $*
+
+if [[ -r $CONFIG_FILE ]]; then
+	# Read globals from config file
+	CONFIG="" read_config
+	# Read config from specified section
+	[[ -n $CONFIG ]] && read_config
+fi
+
+# Re-parse commandline (to override config defaults)
+parseargs $*
+
+# Process requested commands
+if [[ -z $COMMAND ]]; then
+	echo "!!! At least one command is required"
+	exit 1
+fi
+for cmd in $COMMAND; do
+	case $cmd in
+		help)				usage; exit;;
+		clean)				clean_snapshots;;
+		mount-all)			mount_all_snapshots;;
+		snapshoot)			create_snapshot;;
+		grow)				grow_snapshots;;
+		status)				show_snapshot_stats;;
+		latest)				do_latest;;
+	esac
+done
