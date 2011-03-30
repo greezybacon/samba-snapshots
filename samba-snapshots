@@ -95,7 +95,6 @@ EOF
 }
 
 parseargs() {
-	echo "Parseargs: $@"
 	while [[ -n $1 ]]; do
 		case $1 in
 			# Switches and configuration
@@ -281,28 +280,24 @@ remove_snapshot() {
 	# Read shapshot data, removing named TS and VOLUME and write it back
 	# the the SNAPTAB file
 	local IFS=$'\n'
-	{ 
-		{ 
-			for entry in $(cat - | grep -E ";$2;" | sort -t \; -k 1,1 -r); do
-				if [[ -n $(echo $entry | grep -E "^$1") ]]; then
-					# Unmount (?)
-					unmount_snapshot ${1}
-					# This is slated to be removed
-					[[ $VERBOSE ]] && echo "Removing snapshot '$1' of volume '$2'"
-					# XXX: Bug in LVM2 that sometimes prevents unmounted logical
-					#      volumes from being removed. Fix applied from
-					#      http://tuxrx.org/content/cant-remove-open-logical-volume-error
-					/sbin/dmsetup remove ${SNAPSHOT_VG}-${1/-/--}
-					/sbin/lvremove /dev/${SNAPSHOT_VG}/${1} -f 2>&1
-					# Remove mountpoint
-					rmdir $BASEDIR/@GMT-$1 2>&1
-				else
-					# Keep this one
-					echo "$entry" >&2
-				fi
-			done
-		} < $SNAPTAB 
-	} 2> $SNAPTAB.bak
+    for entry in $(cat - | grep -E ";$2;" | sort -t \; -k 1,1 -r); do
+        if [[ -n $(echo $entry | grep -E "^$1") ]]; then
+            # Unmount (?)
+            unmount_snapshot ${1}
+            # This is slated to be removed
+            [[ $VERBOSE ]] && echo "Removing snapshot '$1' of volume '$2'"
+            # XXX: Bug in LVM2 that sometimes prevents unmounted logical
+            #      volumes from being removed. Fix applied from
+            #      http://tuxrx.org/content/cant-remove-open-logical-volume-error
+            /sbin/dmsetup remove ${SNAPSHOT_VG}-${1/-/--}
+            /sbin/lvremove /dev/${SNAPSHOT_VG}/${1} -f 2>&1
+            # Remove mountpoint
+            rmdir $BASEDIR/@GMT-$1 2>&1
+        else
+            # Keep this one
+            echo "$entry" >&2
+        fi
+    done < $SNAPTAB 2> $SNAPTAB.bak
 	mv $SNAPTAB.bak $SNAPTAB
 }
 
@@ -419,11 +414,10 @@ convert_size() {
 }
 
 collect_stats() {
-	if [[ -n $STATS ]]; then
-		echo "$STATS"
-		return
+	if [[ -z $STATS ]]; then
+	    lvs /dev/$VG --noheadings --separator=: 2> /dev/null | sed -e "s/^ *//g"
 	fi
-	lvs /dev/$VG --noheadings --separator=: 2> /dev/null | sed -re "s/^ *//g"
+	echo "$STATS"
 }
 STATS=$(collect_stats)
 
@@ -516,17 +510,13 @@ EOF
 # CONFIG - Config section to read (empty means global)
 read_config() {
 	# Read globals
-	local script=":s;/^ *\[/b n;H;n;b s;:n;x;p;q"
+	local script=":s;/^[[:space:]]*\[/b n;H;n;b s;:n;x;p;q"
 	# Read from specific section
-	# XXX: Doesn't match if section is the last in a file with no trailing
-	#      empty line
-	[[ -n $CONFIG ]] && script="/^\[${CONFIG}\]/{;:s;n;/^ *\[|$/b n;H;b s;:n;x;p;q;}"
-	while [[ -n $1 ]]; do shift; done
+	[[ -n $CONFIG ]] && script="/^[[:space:]]*\[${CONFIG}\]/{:s;n;/^[[:space:]]*\[/p;q;b s"
 	IFS=$'\n' parseargs $(
 		sed -ne "${script}" "$CONFIG_FILE" \
 		| while read line; do          
 			IFS="="$'\n' parts=(${line})
-            echo "Config file line -- " $line
 			parts[0]=${parts[0]//[[:space:]]/}
 			[[ -z ${parts[0]} || ${parts[0]:0:1} == "#" ]] && continue
 			echo "--${parts[0]}"; echo "${parts[1]//\"/}"
