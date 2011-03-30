@@ -32,7 +32,7 @@ executed in the order listed on the commandline.
 Usage:
 Options and commands can be intermixed in any order
 
-    $(basename $0) [options] command [command [...]]
+	$(basename $0) [options] command [command [...]]
 
 Commands:
     clean           Clean old and inactive snapshots
@@ -49,10 +49,10 @@ Options:
     -c, --config    Use section from configuration file. Empty means read
                     items not inside a group (global)
                     Default is '$CONFIG'
-    --config-file   Use alternate configuration file. 
+    --config-file   Use alternate configuration file.
                     Default is '$CONFIG_FILE'
-    -e, --extent    Extent size for snapshots. This size is appended to 
-                    snapshots as their usage exceeds the threshold 
+    -e, --extent    Extent size for snapshots. This size is appended to
+                    snapshots as their usage exceeds the threshold
                     amount (-t). This value can be the percentage of the
                     snapshot current size with trailing '%' character.
                     Default is '$EXTENT'
@@ -65,10 +65,10 @@ Options:
     -o, --mount-opts
                     Mount options when mounting snapshots. Defaults are
                     '$MOUNT_OPTS'
-    -r, --retention Number of snapshots to retain for this volume. This 
+    -r, --retention Number of snapshots to retain for this volume. This
                     number should be the number of snapshots taken per day
-                    times the number of days to retain snapshots. For 
-                    instance, to retain 15 days of snapshots taken twice 
+                    times the number of days to retain snapshots. For
+                    instance, to retain 15 days of snapshots taken twice
                     each day, retention should be 30. Default is '$RETENTION'.
                     See also -S for setting retention based on capacity.
                     Zero means no limit of snapshots.
@@ -78,7 +78,7 @@ Options:
                     every day and take two snapshots each day, size could
                     be set at 512M. Default is '$SIZE'
     -t, --threshold Specify the percentage of used space in a snapshot to
-                    tolerate before increasing its size by 1 extent (-e). 
+                    tolerate before increasing its size by 1 extent (-e).
                     Default is '$THRESHOLD'
     -T, --temp      Work with temporary snapshots. If snapshoot-ing, a temp
                     snapshot will be created. If clean-ing, temporary
@@ -86,7 +86,7 @@ Options:
     -S, --max-space Absolute maximum amount of space allocated to snapshots
                     for the volume in question. When the size of all the
                     snapshots reaches this amount, snapshots will not be
-                    grown any further. Zero means no maximum. 
+                    grown any further. Zero means no maximum.
                     Default is '$MAX_SPACE'.
     -v, --verbose   Do things verbosely
     -vg, --group    Volume group containing the logical volume to snapshoot.
@@ -141,7 +141,7 @@ sanitize() {
 	fi
 }
 # Function: create_snapshot
-# Creates a new snapshot. 
+# Creates a new snapshot.
 #
 # Environment:
 # SNAPNAME - Snapshot name
@@ -149,7 +149,7 @@ sanitize() {
 # SIZE - Snapshot size
 create_snapshot() {
 	# XXX: Use VOLUME prefix or something to allow for this script
-	#      system governing snapshots of multiple volumes
+	#	  system governing snapshots of multiple volumes
 	SNAPNAME=$(TZ=GMT date +%Y.%m.%d-%H.%M.%S)
 	if [[ -z $VOLUME ]]; then
 		echo "!!! Volume required. Use -v option"
@@ -280,24 +280,24 @@ remove_snapshot() {
 	# Read shapshot data, removing named TS and VOLUME and write it back
 	# the the SNAPTAB file
 	local IFS=$'\n'
-    for entry in $(cat - | grep -E ";$2;" | sort -t \; -k 1,1 -r); do
-        if [[ -n $(echo $entry | grep -E "^$1") ]]; then
-            # Unmount (?)
-            unmount_snapshot ${1}
-            # This is slated to be removed
-            [[ $VERBOSE ]] && echo "Removing snapshot '$1' of volume '$2'"
-            # XXX: Bug in LVM2 that sometimes prevents unmounted logical
-            #      volumes from being removed. Fix applied from
-            #      http://tuxrx.org/content/cant-remove-open-logical-volume-error
-            /sbin/dmsetup remove ${SNAPSHOT_VG}-${1/-/--}
-            /sbin/lvremove /dev/${SNAPSHOT_VG}/${1} -f 2>&1
-            # Remove mountpoint
-            rmdir $BASEDIR/@GMT-$1 2>&1
-        else
-            # Keep this one
-            echo "$entry" >&2
-        fi
-    done < $SNAPTAB 2> $SNAPTAB.bak
+	for entry in $(cat - | grep -E ";$2;" | sort -t \; -k 1,1 -r); do
+		if [[ -n $(echo $entry | grep -E "^$1") ]]; then
+			# Unmount (?)
+			unmount_snapshot ${1}
+			# This is slated to be removed
+			[[ $VERBOSE ]] && echo "Removing snapshot '$1' of volume '$2'"
+			# XXX: Bug in LVM2 that sometimes prevents unmounted logical
+			#	  volumes from being removed. Fix applied from
+			#	  http://tuxrx.org/content/cant-remove-open-logical-volume-error
+			/sbin/dmsetup remove ${SNAPSHOT_VG}-${1/-/--}
+			/sbin/lvremove /dev/${SNAPSHOT_VG}/${1} -f 2>&1
+			# Remove mountpoint
+			rmdir $BASEDIR/@GMT-$1 2>&1
+		else
+			# Keep this one
+			echo "$entry" >&2
+		fi
+	done < $SNAPTAB 2> $SNAPTAB.bak
 	mv $SNAPTAB.bak $SNAPTAB
 }
 
@@ -337,7 +337,7 @@ clean_snapshots() {
 			remove_snapshot ${entry[0]} $VOLUME
 			continue
 		elif [[ "1" == $(echo "( $MAX_SPACE != 0 ) && ( $MAX_SPACE < $(get_total_size) )" | bc) ]]; then
-			# Snapshots are enumerated here is reverse order by date. 
+			# Snapshots are enumerated here is reverse order by date.
 			# Remove the oldest one
 			[[ -n $VERBOSE ]] && echo "Cleaning snapshot ${entry[0]} to free space"
 			remove_snapshot ${entry[0]} $VOLUME
@@ -402,7 +402,7 @@ convert_size() {
 	while [[ -n $1 ]]; do
 		i=$1
 		for e in B K M G T; do
-			if [[ ${i: -1:1} =~ "[^BKMGT]" 
+			if [[ ${i: -1:1} =~ "[^BKMGT]"
 					|| $(echo ${i: -1:1} | tr bkmgt BKMGT) == $e ]]; then
 				# Multiply arg by multiplier of unit
 				echo "${i:0:$((${#i}-1))} * ${!e}" | bc
@@ -415,7 +415,7 @@ convert_size() {
 
 collect_stats() {
 	if [[ -z $STATS ]]; then
-	    lvs /dev/$VG --noheadings --separator=: 2> /dev/null | sed -e "s/^ *//g"
+		lvs /dev/$VG --noheadings --separator=: 2> /dev/null | sed -e "s/^ *//g"
 	fi
 	echo "$STATS"
 }
@@ -489,7 +489,7 @@ get_total_size() {
 show_snapshot_stats() {
 		cat <<EOF
 Snapshots for volume "$VOLUME" --------
-Timestamp        	Status	Size	Usage (%)
+Timestamp			Status	Size	Usage (%)
 --------------------------------------------------
 EOF
 	grep ";$VOLUME" $SNAPTAB | sort -t \; -k 1,1 -r | while read line; do
@@ -504,7 +504,7 @@ EOF
 
 # Function: read_config
 # Reads configuration from $CONFIG_FILE
-# 
+#
 # Environment:
 # CONFIG_FILE - Location of configuration file
 # CONFIG - Config section to read (empty means global)
@@ -515,7 +515,7 @@ read_config() {
 	[[ -n $CONFIG ]] && script="/^[[:space:]]*\[${CONFIG}\]/{:s;n;/^[[:space:]]*\[/p;q;b s"
 	IFS=$'\n' parseargs $(
 		sed -ne "${script}" "$CONFIG_FILE" \
-		| while read line; do          
+		| while read line; do
 			IFS="="$'\n' parts=(${line})
 			parts[0]=${parts[0]//[[:space:]]/}
 			[[ -z ${parts[0]} || ${parts[0]:0:1} == "#" ]] && continue
